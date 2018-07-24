@@ -1,13 +1,11 @@
-﻿using AmazonServiceTester.Models;
+﻿using Amazon;
+using Amazon.S3;
+using Amazon.S3.Model;
 using Newtonsoft.Json;
-using Sensus.DataStores.Remote;
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
-using System.Security.Cryptography.X509Certificates;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -15,12 +13,15 @@ namespace AmazonServiceTester
 {
     class Program
     {
+        public static string GetRandom()
+        {
+            return Math.Ceiling((DateTime.Now - new DateTime(2018, 7, 24)).TotalMilliseconds).ToString();
+        }
         static async Task Main(string[] args) //this is part of C# 7.1 which is set in Project/Build/Advanced
         {
             var restClient = new HttpClient();
             var settingsPath = args.Count() > 0 ? args[0] : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
             var curWriteCnt = 0;
-            AmazonS3RemoteDataStore s3Store = null;
             Settings settings = new Settings();
             try
             {
@@ -32,8 +33,8 @@ namespace AmazonServiceTester
                 }
                 Console.WriteLine($"Loading Settings from {settingsPath}");
                 settings = JsonConvert.DeserializeObject<Settings>(File.ReadAllText(settingsPath), new JsonSerializerSettings() { NullValueHandling = NullValueHandling.Include});
-                settings.DeviceId = settings.DeviceId ?? $"console-test-{DateTime.Now.Ticks.ToString("x")}";
-                settings.ParticipantId = settings.ParticipantId ?? $"{settings.DeviceId}-user{DateTime.Now.Ticks.ToString("x")}";
+                settings.DeviceId = settings.DeviceId ?? $"console-test{GetRandom()}";
+                settings.ParticipantId = settings.ParticipantId ?? $"{settings.DeviceId}-user{GetRandom()}";
 
                 Console.Write(consoleBreakText);
 
@@ -71,24 +72,21 @@ namespace AmazonServiceTester
                         {
                             Console.WriteLine($"Sleeping for {settings.WriteInterval} seconds");
                             Console.Write(consoleBreakText);
-                            System.Threading.Thread.Sleep(settings.WriteInterval * 1000); //convert the minutes into ms
+                            Thread.Sleep(settings.WriteInterval * 1000); //convert the minutes into ms
                         }
 
                         Console.WriteLine($"Sending file {curWriteCnt}/{settings.WriteCount}");
-                        var utcExpiration = new DateTimeOffset(long.Parse(credentials.expiration), new TimeSpan(0));
-                        if (utcExpiration <= DateTimeOffset.UtcNow)
+
+                        if (credentials.expirationDateTime <= DateTimeOffset.UtcNow)
                         {
                             Console.WriteLine("Credentials expired so getting new");
                             credentials = await DoGet<AccountCredentials>(getCredentialsUrl, restClient);
-                            s3Store = null;
                         }
                         else
                         {
                             Console.WriteLine("Credentials still good");
                         }
-                        s3Store = s3Store ?? GetS3Store(settings, credentials);
-                        var toUploadString = $"Test upload for {account.participantId} at {DateTimeOffset.UtcNow.Ticks}";
-                        await UploadToS3(toUploadString, s3Store, settings, restClient);
+                        await PutFile(curWriteCnt, settings, credentials);
                         curWriteCnt++;
                     }
                 }
@@ -112,6 +110,30 @@ namespace AmazonServiceTester
             if (k.KeyChar == 's')
             {
                 File.WriteAllText(settingsPath, JsonConvert.SerializeObject(settings));
+            }
+        }
+
+        public static async Task PutFile(int cnt, Settings settings, AccountCredentials credentials)
+        {
+            try
+            {
+                AmazonS3Client s3Client = new AmazonS3Client(
+                                            credentials.accessKeyId,
+                                            credentials.secretAccessKey,
+                                            RegionEndpoint.GetBySystemName(settings.S3Region)
+                                            );
+                var toPut = new PutObjectRequest()
+                {
+                    BucketName = settings.S3Bucket,
+                    Key = $"{settings.ParticipantId}-{cnt}.txt",
+                    ContentType = "text/plain",
+                    ContentBody = $"Hello world {cnt} from {settings.ParticipantId} on {settings.DeviceId} at {DateTime.Now.ToShortDateString()}"
+                };
+                await s3Client.PutObjectAsync(toPut);
+            }
+            catch(Exception exc)
+            {
+                throw;
             }
         }
         static async Task<T> DoGet<T>(string url, HttpClient client)
@@ -151,40 +173,45 @@ namespace AmazonServiceTester
                 throw;
             }
         }
-        static AmazonS3RemoteDataStore GetS3Store(Settings settings, AccountCredentials credentials)
+    }
+
+    class Settings
+    {
+        public string CreateAccountUrl { get; set; }
+        public string GetCredentialsUrl { get; set; }
+        public int WriteInterval { get; set; } = 1; //write every 1 minute by default
+        public int WriteCount { get; set; } = 15;
+        public string DeviceId { get; set; }
+        public string ParticipantId { get; set; }
+        public string S3Region { get; set; } = "us-east-1";
+        public string S3Bucket { get; set; } = "bucketId";
+        public int S3CancellationTime { get; set; } = 60;
+    }
+    public class Account
+    {
+        public string participantId { get; set; }
+        public string password { get; set; }
+    }
+
+    public class AccountCredentials
+    {
+        public string accessKeyId { get; set; }
+        public string secretAccessKey { get; set; }
+        public string protocolURL { get; set; }
+        public string expiration { get; set; }
+        public string cmk { get; set; }
+
+        public DateTimeOffset expirationDateTime
         {
-            AmazonS3RemoteDataStore s3Store = new AmazonS3RemoteDataStore();
-            s3Store.Bucket = settings.S3Bucket;
-            s3Store.ParticipantId = settings.ParticipantId;
-            s3Store.DeviceId = settings.DeviceId;
-            s3Store.Region = settings.S3Region;
-            s3Store.IamAccountString = $"{credentials.accessKeyId}:{credentials.secretAccessKey}";
-            return s3Store;
-        }
-        static async Task<bool> UploadToS3(string contents, AmazonS3RemoteDataStore s3Store, Settings settings, HttpClient client)
-        {
-            try
+            get
             {
-                Console.WriteLine($"Writing {contents} to S3");
-                var cancellationToken = new CancellationTokenSource(settings.S3CancellationTime*60*1000).Token;
-                cancellationToken.ThrowIfCancellationRequested();
-                await s3Store.WriteStringAsync(contents, cancellationToken);
-                Console.WriteLine("\t Write finished");
-                var rVal = await s3Store.GetDatumAsync(s3Store.GetDatumKey(contents), cancellationToken);
-                Console.WriteLine($"\t Read {rVal}");
-                if(rVal != contents)
+                var rVal = DateTimeOffset.MinValue;
+                if (string.IsNullOrWhiteSpace(expiration) == false && long.TryParse(expiration, out long milliseconds))
                 {
-                    throw new Exception("write/read don't match");
+                    rVal = DateTime.SpecifyKind(new DateTime(1970, 1, 1), DateTimeKind.Utc).AddMilliseconds(milliseconds);
                 }
-
-                return true;
-            }
-            catch(Exception exc)
-            {
-                Console.WriteLine("Write failed. Msg:" + exc.Message);
-                return false;
+                return rVal;
             }
         }
-
     }
 }
