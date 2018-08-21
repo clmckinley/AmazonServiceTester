@@ -5,6 +5,7 @@ using Newtonsoft.Json;
 using System;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,7 +20,20 @@ namespace AmazonServiceTester
         }
         static async Task Main(string[] args) //this is part of C# 7.1 which is set in Project/Build/Advanced
         {
-            var restClient = new HttpClient();
+            var handler = new HttpClientHandler();
+            handler.ClientCertificateOptions = ClientCertificateOption.Manual;
+            handler.ServerCertificateCustomValidationCallback = (httpRequestMessage, cert, cetChain, policyErrors) =>
+                            {
+                                if(policyErrors == System.Net.Security.SslPolicyErrors.None)
+                                {
+                                    return true;
+                                }
+                                System.Diagnostics.Trace.WriteLine(cert.GetCertHashString());
+                                return true;
+                            };
+
+
+            var restClient = new HttpClient(handler);
             var settingsPath = args.Count() > 0 ? args[0] : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
             var curWriteCnt = 0;
             Settings settings = new Settings();
@@ -75,7 +89,8 @@ namespace AmazonServiceTester
                             Thread.Sleep(settings.WriteInterval * 1000); //convert the minutes into ms
                         }
 
-                        Console.WriteLine($"Sending file {curWriteCnt}/{settings.WriteCount}");
+                        Console.WriteLine($"Sending file {curWriteCnt + 1}/{settings.WriteCount}");
+
 
                         if (credentials.expirationDateTime <= DateTimeOffset.UtcNow)
                         {
@@ -104,6 +119,8 @@ namespace AmazonServiceTester
             {
                 restClient.Dispose();
                 restClient = null;
+                handler.Dispose();
+                handler = null;
             }
             Console.WriteLine("Press any key to exit");
             var k = Console.ReadKey();
@@ -117,9 +134,9 @@ namespace AmazonServiceTester
         {
             try
             {
-                AmazonS3Client s3Client = new AmazonS3Client(
-                                            credentials.accessKeyId,
-                                            credentials.secretAccessKey,
+                AmazonS3Client s3Client = new AmazonS3Client(credentials.accessKeyId, 
+                                            credentials.secretAccessKey, 
+                                            credentials.sessionToken,
                                             RegionEndpoint.GetBySystemName(settings.S3Region)
                                             );
                 var toPut = new PutObjectRequest()
@@ -131,6 +148,17 @@ namespace AmazonServiceTester
                 };
                 await s3Client.PutObjectAsync(toPut);
             }
+            catch(WebException exc)
+            {
+                var c = exc;
+            }
+            //catch(AmazonS3Exception exc)
+            //{
+            //    if(exc.ErrorCode == "InvalidAccessKeyId" || exc.ErrorCode == "SignatureDoesNotMatch" || exc.ErrorCode == "InvalidToken")
+            //    {
+            //        var t = "retry";
+            //    }
+            //}
             catch(Exception exc)
             {
                 throw;
@@ -197,6 +225,7 @@ namespace AmazonServiceTester
     {
         public string accessKeyId { get; set; }
         public string secretAccessKey { get; set; }
+        public string sessionToken { get; set; }
         public string protocolURL { get; set; }
         public string expiration { get; set; }
         public string cmk { get; set; }
